@@ -2,11 +2,19 @@
   "watchlist": [
     "SPY",
     "QQQ",
+    "DIA",
+    "IWM",
     "AAPL",
-    "TSLA",
+    "MSFT",
     "NVDA",
+    "TSLA",
     "AMZN",
-    "MSFT"
+    "META",
+    "GOOGL",
+    "AMD",
+    "AVGO",
+    "NFLX",
+    "SMCI"
   ],
   "scan": {
     "dte_min": 30,
