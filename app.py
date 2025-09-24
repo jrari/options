@@ -218,16 +218,16 @@ with tabs[0]:
             st.subheader("Order Ticket Helper")
             if sel["strategy"]=="bull_put":
                 be = float(sel["short"]) - float(sel["credit"])
-                txt = f\"\"\"LEG1: SELL TO OPEN {sel['ticker']} PUT {sel['expiry']} {sel['short']:.2f}
+                txt = f"""LEG1: SELL TO OPEN {sel['ticker']} PUT {sel['expiry']} {sel['short']:.2f}
 LEG2: BUY  TO OPEN {sel['ticker']} PUT {sel['expiry']} {sel['long']:.2f}
 TYPE: LIMIT CREDIT (${sel['credit']:.2f}) | QTY: 1+ | TIF: DAY
-Breakeven ≈ {be:.2f}\"\"\"
+Breakeven ≈ {be:.2f}"""
             else:
                 be = float(sel["short"]) + float(sel["credit"])
-                txt = f\"\"\"LEG1: SELL TO OPEN {sel['ticker']} CALL {sel['expiry']} {sel['short']:.2f}
+                txt = f"""LEG1: SELL TO OPEN {sel['ticker']} CALL {sel['expiry']} {sel['short']:.2f}
 LEG2: BUY  TO OPEN {sel['ticker']} CALL {sel['expiry']} {sel['long']:.2f}
 TYPE: LIMIT CREDIT (${sel['credit']:.2f}) | QTY: 1+ | TIF: DAY
-Breakeven ≈ {be:.2f}\"\"\"
+Breakeven ≈ {be:.2f}"""
             st.code(txt, language="text")
 
             # Discord alert (optional)
