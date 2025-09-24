@@ -32,16 +32,38 @@ tabs = st.tabs(["🔎 Auto-Scanner", "⏰ Premarket Gappers", "📊 Single Ticke
 AUTO_THREAD = None
 AUTO_STOP = threading.Event()
 
+def _underlying_flow_metrics(ticker: str) -> tuple[float, float]:
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(period="2mo", interval="1d")
+        if hist is None or hist.empty or len(hist) < 2:
+            return 0.0, 0.0
+        today = hist.iloc[-1]
+        prev = hist.iloc[-2]
+        pct = float(100.0 * (today["Close"] - prev["Close"]) / prev["Close"]) if prev["Close"] > 0 else 0.0
+        avg30 = float(hist["Volume"].tail(30).mean()) if len(hist) >= 30 else float(hist["Volume"].mean())
+        vol_mult = float(today["Volume"]) / avg30 if avg30 > 0 else 0.0
+        return pct, vol_mult
+    except Exception:
+        return 0.0, 0.0
+
 def _run_scan_and_archive(tickers: list[str], use_bull_put: bool, use_bear_call: bool,
                           rank_mode: str, dte_min: int, dte_max: int, rf: float,
                           max_spread: float, min_oi: int,
-                          w_pop: float, w_roi: float, w_liq: float, w_ive: float, w_uvx: float,
+                          w_pop: float, w_roi: float, w_liq: float, w_ive: float, w_uvx: float, w_flow: float,
+                          min_px_chg_pct: float, min_vol_mult: float,
                           discord_enabled: bool, discord_url: str, send_discord_on_alert: bool) -> None:
     try:
         results = []
         for tk in tickers:
             try:
                 spot, hv = fetch_underlying_and_hv(tk, 20)
+                pct, volx = _underlying_flow_metrics(tk)
+                flow = 0.0
+                if min_px_chg_pct > 0 or min_vol_mult > 0:
+                    a = abs(pct)/min_px_chg_pct if min_px_chg_pct > 0 else 0.0
+                    b = volx/min_vol_mult if min_vol_mult > 0 else 0.0
+                    flow = float(max(0.0, min(1.0, max(a, b))))
                 exps = fetch_option_expiries(tk)
                 for exp in exps:
                     dte = _days_to_expiry(exp)
@@ -60,7 +82,10 @@ def _run_scan_and_archive(tickers: list[str], use_bull_put: bool, use_bear_call:
                             width = short_k - long_k; max_loss = max(width - credit, 0.01); roi = credit / max_loss
                             iv_edge = (sigma - hv) if (not np.isnan(sigma) and not np.isnan(hv)) else 0.0
                             uvx = (row.get("volume",0) or 0)/max((row.get("openInterest",1) or 1),1)
-                            score = w_pop*pop + w_roi*min(roi,1.0) + w_liq*liq + w_ive*min(max(iv_edge,0.0),1.0) + w_uvx*min(uvx/10.0,1.0)
+                            score = (
+                                w_pop*pop + w_roi*min(roi,1.0) + w_liq*liq +
+                                w_ive*min(max(iv_edge,0.0),1.0) + w_uvx*min(uvx/10.0,1.0) + w_flow*flow
+                            )
                             results.append({"strategy":"bull_put","ticker":tk,"spot":round(spot,2),"expiry":exp,"dte":dte,"short":short_k,"long":long_k,"credit":round(credit,2),"pop":round(pop,4),"roi":round(roi,3),"liq":round(liq,3),"iv_edge":round(iv_edge,3),"uvx":round(uvx,3),"score":round(score,3)})
 
                     if use_bear_call and not calls_f.empty:
@@ -71,7 +96,10 @@ def _run_scan_and_archive(tickers: list[str], use_bull_put: bool, use_bear_call:
                             width = long_k - short_k; max_loss = max(width - credit, 0.01); roi = credit / max_loss
                             iv_edge = (sigma - hv) if (not np.isnan(sigma) and not np.isnan(hv)) else 0.0
                             uvx = (row.get("volume",0) or 0)/max((row.get("openInterest",1) or 1),1)
-                            score = w_pop*pop + w_roi*min(roi,1.0) + w_liq*liq + w_ive*min(max(iv_edge,0.0),1.0) + w_uvx*min(uvx/10.0,1.0)
+                            score = (
+                                w_pop*pop + w_roi*min(roi,1.0) + w_liq*liq +
+                                w_ive*min(max(iv_edge,0.0),1.0) + w_uvx*min(uvx/10.0,1.0) + w_flow*flow
+                            )
                             results.append({"strategy":"bear_call","ticker":tk,"spot":round(spot,2),"expiry":exp,"dte":dte,"short":short_k,"long":long_k,"credit":round(credit,2),"pop":round(pop,4),"roi":round(roi,3),"liq":round(liq,3),"iv_edge":round(iv_edge,3),"uvx":round(uvx,3),"score":round(score,3)})
             except Exception:
                 continue
@@ -145,7 +173,8 @@ def _ensure_scheduler(tickers: list[str], interval_min: int,
         rank_mode=rank_mode,
         dte_min=dte_min, dte_max=dte_max, rf=rf,
         max_spread=max_spread, min_oi=min_oi,
-        w_pop=w_pop, w_roi=w_roi, w_liq=w_liq, w_ive=w_ive, w_uvx=w_uvx,
+        w_pop=w_pop, w_roi=w_roi, w_liq=w_liq, w_ive=w_ive, w_uvx=w_uvx, w_flow=w_flow,
+        min_px_chg_pct=min_px_chg_pct, min_vol_mult=min_vol_mult,
         discord_enabled=discord_enabled, discord_url=discord_url, send_discord_on_alert=send_discord_on_alert
     )
     if AUTO_THREAD is None or not AUTO_THREAD.is_alive():
@@ -173,10 +202,16 @@ with tabs[3]:
     with colw3: w_liq = st.slider("Liq w", 0.0, 1.0, 0.20, 0.05)
     with colw4: w_ive = st.slider("IV Edge w", 0.0, 1.0, 0.10, 0.05)
     with colw5: w_uvx = st.slider("Unusual Vol w", 0.0, 1.0, 0.10, 0.05)
-    w_sum = w_pop + w_roi + w_liq + w_ive + w_uvx
-    if w_sum == 0: w_pop, w_roi, w_liq, w_ive, w_uvx, w_sum = 0.4,0.2,0.2,0.1,0.1,1.0
-    w_pop, w_roi, w_liq, w_ive, w_uvx = [w/w_sum for w in (w_pop, w_roi, w_liq, w_ive, w_uvx)]
+    st.caption("Optional: weight price-change/volume flow (news/volume/price spikes)")
+    w_flow = st.slider("Flow w", 0.0, 1.0, 0.10, 0.05)
+    w_sum = w_pop + w_roi + w_liq + w_ive + w_uvx + w_flow
+    if w_sum == 0: w_pop, w_roi, w_liq, w_ive, w_uvx, w_flow, w_sum = 0.35,0.2,0.2,0.1,0.05,0.1,1.0
+    w_pop, w_roi, w_liq, w_ive, w_uvx, w_flow = [w/w_sum for w in (w_pop, w_roi, w_liq, w_ive, w_uvx, w_flow)]
     st.markdown("---")
+    st.subheader("Flow/News Filters")
+    colf1, colf2 = st.columns(2)
+    with colf1: min_px_chg_pct = st.number_input("Min price change % (abs)", 0.0, 50.0, 2.0, 0.5)
+    with colf2: min_vol_mult = st.number_input("Min volume multiple vs 30D avg", 0.0, 50.0, 2.0, 0.5)
     st.subheader("Discord Alerts")
     discord_enabled = st.toggle("Enable Discord alerts", value=False)
     discord_url = st.text_input("Discord Webhook URL", value="", type="default")
@@ -276,7 +311,8 @@ with tabs[0]:
             rank_mode=rank_mode,
             dte_min=int(dte_min), dte_max=int(dte_max), rf=float(rf),
             max_spread=float(max_spread), min_oi=int(min_oi),
-            w_pop=float(w_pop), w_roi=float(w_roi), w_liq=float(w_liq), w_ive=float(w_ive), w_uvx=float(w_uvx),
+            w_pop=float(w_pop), w_roi=float(w_roi), w_liq=float(w_liq), w_ive=float(w_ive), w_uvx=float(w_uvx), w_flow=float(w_flow),
+            min_px_chg_pct=float(min_px_chg_pct), min_vol_mult=float(min_vol_mult),
             discord_enabled=bool(discord_enabled), discord_url=str(discord_url), send_discord_on_alert=bool(send_discord_on_alert)
         )
         st.caption(f"Auto-scan running every {int(auto_scan_minutes)} minutes in the background. Keep this tab open.")
