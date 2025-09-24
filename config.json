@@ -1,0 +1,18 @@
+{
+  "watchlist": [
+    "SPY",
+    "QQQ",
+    "AAPL",
+    "TSLA",
+    "NVDA",
+    "AMZN",
+    "MSFT"
+  ],
+  "scan": {
+    "dte_min": 30,
+    "dte_max": 90,
+    "min_oi": 100,
+    "max_spread_pct": 0.05,
+    "risk_free_rate": 0.045
+  }
+}
