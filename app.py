@@ -1,6 +1,8 @@
 
 import os, json, math
 from datetime import datetime
+import threading, time
+import schedule
 import streamlit as st, pandas as pd, numpy as np, yfinance as yf
 
 from modules.scanner import (
@@ -25,6 +27,131 @@ def load_config():
 cfg = load_config()
 
 tabs = st.tabs(["🔎 Auto-Scanner", "⏰ Premarket Gappers", "📊 Single Ticker", "⚙️ Settings", "🧾 Logs"])
+
+# ---- Auto-scan runtime (background) ----
+AUTO_THREAD = None
+AUTO_STOP = threading.Event()
+
+def _run_scan_and_archive(tickers: list[str], use_bull_put: bool, use_bear_call: bool,
+                          rank_mode: str, dte_min: int, dte_max: int, rf: float,
+                          max_spread: float, min_oi: int,
+                          w_pop: float, w_roi: float, w_liq: float, w_ive: float, w_uvx: float,
+                          discord_enabled: bool, discord_url: str, send_discord_on_alert: bool) -> None:
+    try:
+        results = []
+        for tk in tickers:
+            try:
+                spot, hv = fetch_underlying_and_hv(tk, 20)
+                exps = fetch_option_expiries(tk)
+                for exp in exps:
+                    dte = _days_to_expiry(exp)
+                    if dte < dte_min or dte > dte_max: continue
+                    calls, puts = fetch_option_chain(tk, exp)
+                    atm_iv = _atm_iv_from_chain(pd.concat([calls, puts], ignore_index=True), spot)
+                    sigma = atm_iv if not np.isnan(atm_iv) else (hv if not np.isnan(hv) else 0.3)
+                    puts_f = filter_liquidity(puts, max_spread, min_oi)
+                    calls_f = filter_liquidity(calls, max_spread, min_oi)
+
+                    if use_bull_put and not puts_f.empty:
+                        for short_k, long_k, credit in build_bull_put_spreads(puts_f, spot):
+                            row = puts_f[puts_f["strike"]==short_k].head(1).iloc[0].to_dict()
+                            liq = float(0.6*(1 - min(max(row.get("spread_pct",0.0),0.0),0.2)/0.2) + 0.4*min((row.get("openInterest",0) or 0)/1000.0,1.0))
+                            pop = pop_bull_put_closed_form(spot, short_k, credit, rf, sigma, dte/252.0)
+                            width = short_k - long_k; max_loss = max(width - credit, 0.01); roi = credit / max_loss
+                            iv_edge = (sigma - hv) if (not np.isnan(sigma) and not np.isnan(hv)) else 0.0
+                            uvx = (row.get("volume",0) or 0)/max((row.get("openInterest",1) or 1),1)
+                            score = w_pop*pop + w_roi*min(roi,1.0) + w_liq*liq + w_ive*min(max(iv_edge,0.0),1.0) + w_uvx*min(uvx/10.0,1.0)
+                            results.append({"strategy":"bull_put","ticker":tk,"spot":round(spot,2),"expiry":exp,"dte":dte,"short":short_k,"long":long_k,"credit":round(credit,2),"pop":round(pop,4),"roi":round(roi,3),"liq":round(liq,3),"iv_edge":round(iv_edge,3),"uvx":round(uvx,3),"score":round(score,3)})
+
+                    if use_bear_call and not calls_f.empty:
+                        for short_k, long_k, credit in build_bear_call_spreads(calls_f, spot):
+                            row = calls_f[calls_f["strike"]==short_k].head(1).iloc[0].to_dict()
+                            liq = float(0.6*(1 - min(max(row.get("spread_pct",0.0),0.0),0.2)/0.2) + 0.4*min((row.get("openInterest",0) or 0)/1000.0,1.0))
+                            pop = pop_bear_call_closed_form(spot, short_k, credit, rf, sigma, dte/252.0)
+                            width = long_k - short_k; max_loss = max(width - credit, 0.01); roi = credit / max_loss
+                            iv_edge = (sigma - hv) if (not np.isnan(sigma) and not np.isnan(hv)) else 0.0
+                            uvx = (row.get("volume",0) or 0)/max((row.get("openInterest",1) or 1),1)
+                            score = w_pop*pop + w_roi*min(roi,1.0) + w_liq*liq + w_ive*min(max(iv_edge,0.0),1.0) + w_uvx*min(uvx/10.0,1.0)
+                            results.append({"strategy":"bear_call","ticker":tk,"spot":round(spot,2),"expiry":exp,"dte":dte,"short":short_k,"long":long_k,"credit":round(credit,2),"pop":round(pop,4),"roi":round(roi,3),"liq":round(liq,3),"iv_edge":round(iv_edge,3),"uvx":round(uvx,3),"score":round(score,3)})
+            except Exception:
+                continue
+        if not results:
+            return
+        df = pd.DataFrame(results)
+        df["pop_pct"] = (df["pop"]*100.0).round(2)
+        def exp_ret_pct(row):
+            w = max(abs(row["short"]-row["long"]), 0.01); return 100.0*(row["credit"]/w)
+        df["exp_ret_pct"] = df.apply(exp_ret_pct, axis=1).round(2)
+        if rank_mode=="POP %": df = df.sort_values(["pop_pct","score"], ascending=[False,False])
+        elif rank_mode=="Expected Return %": df = df.sort_values(["exp_ret_pct","score"], ascending=[False,False])
+        else: df = df.sort_values("score", ascending=False)
+        df = df.reset_index(drop=True)
+
+        # Archive full scan
+        try: archive_scan_dataframe(df, "scans")
+        except Exception: pass
+
+        # Save Top 20 CSV and Parquet/SQLite archive
+        top20 = df.head(20).copy()
+        csv_path = os.path.join(DATA_DIR, "top20.csv"); top20.to_csv(csv_path, index=False)
+        try: archive_top20_csv(csv_path, "top20")
+        except Exception: pass
+
+        # Optional Discord alert for best candidate
+        if send_discord_on_alert and discord_enabled and discord_url:
+            try:
+                sel = df.iloc[0]
+                chart_path = os.path.join(DATA_DIR, "payoff.png")
+                if sel["strategy"]=="bull_put":
+                    payoff_bull_put_chart(sel["spot"], sel["short"], sel["long"], sel["credit"], chart_path)
+                else:
+                    payoff_bull_put_chart(sel["spot"], sel["long"], sel["short"], sel["credit"], chart_path)
+                fields=[{"name":"POP %","value":str(sel['pop_pct']),"inline":True},
+                        {"name":"ExpRet %","value":str(100.0*(sel['credit']/max(abs(sel['short']-sel['long']),0.01)))[:6],"inline":True},
+                        {"name":"Credit","value":str(sel['credit']),"inline":True},
+                        {"name":"Expiry","value":sel['expiry'],"inline":True}]
+                strikes=f"short:{sel.get('short','')}, long:{sel.get('long','')}"
+                fields.append({"name":"Strikes","value":strikes,"inline":False})
+                embed=[{"title": f"{sel['ticker']} — {sel['strategy']}", "description": f"Score {sel['score']}", "fields": fields}]
+                files=[("file", ("payoff.png", open(chart_path,"rb"), "image/png"))]
+                csvf = os.path.join(DATA_DIR, "top20.csv")
+                if os.path.exists(csvf): files.append(("file", ("top20.csv", open(csvf,"rb"), "text/csv")))
+                send_discord_webhook(discord_url, content="Options Bot Alert", embeds=embed, files=files)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _auto_loop():
+    while not AUTO_STOP.is_set():
+        try:
+            schedule.run_pending()
+        except Exception:
+            pass
+        time.sleep(1)
+
+def _ensure_scheduler(tickers: list[str], interval_min: int,
+                      use_bull_put: bool, use_bear_call: bool, rank_mode: str,
+                      dte_min: int, dte_max: int, rf: float, max_spread: float, min_oi: int,
+                      w_pop: float, w_roi: float, w_liq: float, w_ive: float, w_uvx: float,
+                      discord_enabled: bool, discord_url: str, send_discord_on_alert: bool):
+    global AUTO_THREAD
+    schedule.clear()
+    schedule.every(max(1, int(interval_min))).minutes.do(
+        _run_scan_and_archive,
+        tickers=tickers,
+        use_bull_put=use_bull_put,
+        use_bear_call=use_bear_call,
+        rank_mode=rank_mode,
+        dte_min=dte_min, dte_max=dte_max, rf=rf,
+        max_spread=max_spread, min_oi=min_oi,
+        w_pop=w_pop, w_roi=w_roi, w_liq=w_liq, w_ive=w_ive, w_uvx=w_uvx,
+        discord_enabled=discord_enabled, discord_url=discord_url, send_discord_on_alert=send_discord_on_alert
+    )
+    if AUTO_THREAD is None or not AUTO_THREAD.is_alive():
+        AUTO_STOP.clear()
+        AUTO_THREAD = threading.Thread(target=_auto_loop, daemon=True)
+        AUTO_THREAD.start()
 
 # ---- Settings ----
 with tabs[3]:
@@ -136,6 +263,28 @@ with tabs[0]:
     use_bull_put = st.checkbox("Bull Put (credit)", value=True)
     use_bear_call = st.checkbox("Bear Call (credit)", value=True)
     send_discord_on_alert = st.checkbox("Send Discord alert for top candidate", value=False)
+    auto_scan_enabled = st.toggle("Auto-scan every N minutes", value=False, key="auto_scan_enabled")
+    auto_scan_minutes = st.number_input("Auto-scan interval (minutes)", 1, 240, 15, 1)
+
+    # Start/stop background auto-scanner
+    if auto_scan_enabled and tickers:
+        _ensure_scheduler(
+            tickers=tickers,
+            interval_min=int(auto_scan_minutes),
+            use_bull_put=use_bull_put,
+            use_bear_call=use_bear_call,
+            rank_mode=rank_mode,
+            dte_min=int(dte_min), dte_max=int(dte_max), rf=float(rf),
+            max_spread=float(max_spread), min_oi=int(min_oi),
+            w_pop=float(w_pop), w_roi=float(w_roi), w_liq=float(w_liq), w_ive=float(w_ive), w_uvx=float(w_uvx),
+            discord_enabled=bool(discord_enabled), discord_url=str(discord_url), send_discord_on_alert=bool(send_discord_on_alert)
+        )
+        st.caption(f"Auto-scan running every {int(auto_scan_minutes)} minutes in the background. Keep this tab open.")
+    else:
+        try:
+            schedule.clear(); AUTO_STOP.set()
+        except Exception:
+            pass
 
     if st.button("Run Scan", type="primary"):
         results = []
@@ -212,7 +361,7 @@ with tabs[0]:
             st.subheader("Expected Profit (Hi-Precision)")
             is_put = (sel["strategy"]=="bull_put")
             ev, pop_mc = expected_pnl_mc_vertical(sel["spot"], float(sel["short"]), float(sel["long"]), float(sel["credit"]), is_put, rf, max(sel.get("iv_edge",0)+0.2,0.15), sel["dte"]/252.0, 30000, 777)
-            st.write(f"EV (per spread) ≈ ${ev:.2f} | POP_MC ≈ {pop_mc*100:.2f}% | POP_CF ≈ {sel['pop']*100:.2f}%")
+            st.write(f"EV (per spread) approx ${ev:.2f} | POP_MC approx {pop_mc*100:.2f}% | POP_CF approx {sel['pop']*100:.2f}%")
 
             # Order Ticket Helper
             st.subheader("Order Ticket Helper")
@@ -221,13 +370,13 @@ with tabs[0]:
                 txt = f"""LEG1: SELL TO OPEN {sel['ticker']} PUT {sel['expiry']} {sel['short']:.2f}
 LEG2: BUY  TO OPEN {sel['ticker']} PUT {sel['expiry']} {sel['long']:.2f}
 TYPE: LIMIT CREDIT (${sel['credit']:.2f}) | QTY: 1+ | TIF: DAY
-Breakeven ≈ {be:.2f}"""
+Breakeven approx {be:.2f}"""
             else:
                 be = float(sel["short"]) + float(sel["credit"])
                 txt = f"""LEG1: SELL TO OPEN {sel['ticker']} CALL {sel['expiry']} {sel['short']:.2f}
 LEG2: BUY  TO OPEN {sel['ticker']} CALL {sel['expiry']} {sel['long']:.2f}
 TYPE: LIMIT CREDIT (${sel['credit']:.2f}) | QTY: 1+ | TIF: DAY
-Breakeven ≈ {be:.2f}"""
+Breakeven approx {be:.2f}"""
             st.code(txt, language="text")
 
             # Discord alert (optional)
