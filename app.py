@@ -105,7 +105,10 @@ with tabs[1]:
             dfg = dfg.sort_values(["premkt_pct","premkt_vol"], ascending=[False,False]).reset_index(drop=True)
             st.dataframe(dfg.head(50), use_container_width=True)
             gcsv = os.path.join(DATA_DIR, "premarket_gappers.csv"); dfg.to_csv(gcsv, index=False)
-            try: archive_gappers_csv(gcsv, "gappers")
+            try:
+                import os
+                os.makedirs(DATA_DIR, exist_ok=True)
+                archive_gappers_csv(gcsv, "gappers")
             except Exception as e: st.caption(f"Gappers archive warning: {e}")
             st.caption("Saved premarket_gappers.csv and archived.")
         else:
